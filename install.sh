@@ -158,6 +158,7 @@ chmod 600 "$CONFIG"
 log "wrote $CONFIG"
 
 # ---- systemd service ----------------------------------------------------
+mkdir -p /etc/systemd/system
 cat > "$SERVICE" <<'EOF'
 [Unit]
 Description=KSXNode Node
