@@ -82,7 +82,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ "$(id -u)" -eq 0 ] || die "Please run as root (or use sudo)."
+if which id >/dev/null 2>&1; then
+  [ "$(id -u)" -eq 0 ] || die "Please run as root (or use sudo)."
+fi
 [ -n "$PANEL" ] || die "--panel is required"
 [ -n "$TOKEN" ] || die "--token is required"
 PANEL="${PANEL%/}"
@@ -124,10 +126,14 @@ esac
 log "init system: $SERVICE_MODE"
 
 if [ -z "$DOMAIN" ]; then
-  DOMAIN=$(printf '%s' "$PANEL" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
+  DOMAIN=$(printf '%s' "$PANEL" | sed -e 's#^[a-z][a-z]*://##' -e 's#/.*##')
 fi
 
-need() { command -v "$1" >/dev/null 2>&1; }
+need() {
+  if which "$1" >/dev/null 2>&1; then return 0; fi
+  if command -v "$1" >/dev/null 2>&1; then return 0; fi
+  return 1
+}
 need gzip || die "Missing required command: gzip"
 if ! need curl && ! need wget && ! need uclient-fetch; then
   die "Missing downloader: install curl, or (OpenWrt) opkg update && opkg install ca-bundle"
