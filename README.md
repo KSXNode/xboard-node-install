@@ -4,7 +4,9 @@ KSXNode 節點安裝腳本與多架構執行檔。
 
 - 支援 `linux/amd64`、`linux/arm64`、`linux/arm/v7`
 - 支援 node 模式（單一節點）與 machine 模式（面板動態下發節點）
+- 支援 systemd（Debian / Ubuntu 等）與 OpenWrt / ImmortalWrt 的 procd
 - 透過 GitHub Releases 下載執行檔，不依賴私有映像倉庫
+- 目前最新 Release：`v1.13-hotoutbound`（含出站熱載入，新增 outbound 不需重啟節點）
 
 ## 安裝
 
@@ -12,7 +14,7 @@ KSXNode 節點安裝腳本與多架構執行檔。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/install.sh \
-  | sudo bash -s -- \
+  | sudo sh -s -- \
       --mode machine \
       --panel https://panel.example.com \
       --token YOUR_MACHINE_TOKEN \
@@ -23,12 +25,30 @@ curl -fsSL https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/install.sh \
-  | sudo bash -s -- \
+  | sudo sh -s -- \
       --mode node \
       --panel https://panel.example.com \
       --token YOUR_NODE_TOKEN \
       --node-id 1
 ```
+
+### OpenWrt / ImmortalWrt
+
+以 root 執行（沒有 sudo），並先確定有 `ca-bundle`：
+
+```sh
+opkg update && opkg install ca-bundle
+
+wget -qO- https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/install.sh \
+  | sh -s -- \
+      --mode machine \
+      --panel https://panel.example.com \
+      --token YOUR_MACHINE_TOKEN \
+      --machine-id 1
+```
+
+腳本會自動判斷 init 系統：有 `/run/systemd/system` 用 systemd，有 `/etc/rc.common`
+用 procd。也可以用 `--service` 指定。
 
 ## 參數
 
@@ -42,6 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/in
 | `--kernel NAME` | 核心類型，預設 `singbox` |
 | `--domain DOMAIN` | 憑證網域，預設取面板 hostname |
 | `--version TAG` | 指定 Release 版本，預設 `latest` |
+| `--service MODE` | `auto`、`systemd`、`procd` 或 `none`，預設 `auto` |
 | `--force` | 覆蓋既有設定（仍會先備份） |
 
 ## 安裝內容
@@ -50,14 +71,25 @@ curl -fsSL https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/in
 |------|------|
 | `/usr/local/bin/xboard-node` | 節點執行檔 |
 | `/etc/xboard-node/config.yml` | 設定檔（權限 600） |
-| `/etc/systemd/system/xboard-node.service` | systemd 服務 |
+| `/etc/systemd/system/xboard-node.service` | systemd 服務（systemd 主機） |
+| `/etc/init.d/xboard-node` | procd 服務（OpenWrt / ImmortalWrt） |
 
 ## 管理
+
+systemd：
 
 ```bash
 systemctl status xboard-node
 journalctl -u xboard-node -f
 systemctl restart xboard-node
+```
+
+OpenWrt / ImmortalWrt：
+
+```sh
+/etc/init.d/xboard-node status
+logread | grep xboard-node
+/etc/init.d/xboard-node restart
 ```
 
 ## 版本與執行檔
@@ -67,6 +99,13 @@ systemctl restart xboard-node
 <https://github.com/KSXNode/xboard-node-install/releases>
 
 Asset 命名：`xboard-node-amd64.gz`、`xboard-node-arm64.gz`、`xboard-node-armv7.gz`。
+每個 Release 附 `checksums.txt`（SHA256）。
+
+要固定版本：
+
+```bash
+--version v1.13-hotoutbound
+```
 
 ## 安全
 

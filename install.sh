@@ -1,19 +1,25 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # KSXNode Node installer.
 #
 # Usage (machine mode):
 #   curl -fsSL https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/install.sh \
-#     | sudo bash -s -- --mode machine --panel https://panel.example.com \
+#     | sudo sh -s -- --mode machine --panel https://panel.example.com \
 #         --token MACHINE_TOKEN --machine-id 1
 #
 # Usage (single node):
 #   curl -fsSL https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/install.sh \
-#     | sudo bash -s -- --mode node --panel https://panel.example.com \
+#     | sudo sh -s -- --mode node --panel https://panel.example.com \
 #         --token NODE_TOKEN --node-id 1
 #
+# Usage (OpenWrt / ImmortalWrt, run as root):
+#   wget -qO- https://raw.githubusercontent.com/KSXNode/xboard-node-install/main/install.sh \
+#     | sh -s -- --mode machine --panel https://panel.example.com \
+#         --token MACHINE_TOKEN --machine-id 1
+#
 # The script installs /usr/local/bin/xboard-node, writes
-# /etc/xboard-node/config.yml and creates a systemd service.
-set -Eeuo pipefail
+# /etc/xboard-node/config.yml and creates a systemd unit or an OpenWrt
+# procd service, depending on the init system it detects.
+set -eu
 
 MODE="node"
 PANEL=""
@@ -23,13 +29,15 @@ MACHINE_ID=""
 KERNEL="singbox"
 DOMAIN=""
 VERSION="latest"
+SERVICE_MODE="auto"
 FORCE=0
 
 REPO="KSXNode/xboard-node-install"
 INSTALL_DIR="/etc/xboard-node"
 CONFIG="$INSTALL_DIR/config.yml"
 BIN="/usr/local/bin/xboard-node"
-SERVICE="/etc/systemd/system/xboard-node.service"
+UNIT="/etc/systemd/system/xboard-node.service"
+INITD="/etc/init.d/xboard-node"
 
 log()  { printf '\033[1;32m[KSXNode]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[KSXNode]\033[0m %s\n' "$*"; }
@@ -48,6 +56,7 @@ Options:
   --kernel NAME         Kernel type (default: singbox)
   --domain DOMAIN       Certificate domain (default: panel hostname)
   --version TAG         Release tag (default: latest)
+  --service MODE        Init system: auto|systemd|procd|none (default: auto)
   --force               Overwrite an existing config
   -h, --help            Show this help
 EOF
@@ -63,6 +72,7 @@ while [ $# -gt 0 ]; do
     --kernel) KERNEL="${2:-}"; shift 2 ;;
     --domain) DOMAIN="${2:-}"; shift 2 ;;
     --version) VERSION="${2:-}"; shift 2 ;;
+    --service) SERVICE_MODE="${2:-}"; shift 2 ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (use --help)" ;;
@@ -88,15 +98,34 @@ case "$(uname -m)" in
 esac
 log "architecture: $ARCH"
 
+# ---- detect init system -------------------------------------------------
+detect_service() {
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    echo systemd
+  elif [ -f /etc/rc.common ]; then
+    echo procd
+  else
+    echo none
+  fi
+}
+
+if [ "$SERVICE_MODE" = "auto" ]; then
+  SERVICE_MODE=$(detect_service)
+fi
+case "$SERVICE_MODE" in
+  systemd|procd|none) ;;
+  *) die "--service must be auto, systemd, procd or none" ;;
+esac
+log "init system: $SERVICE_MODE"
+
 if [ -z "$DOMAIN" ]; then
   DOMAIN=$(printf '%s' "$PANEL" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
 fi
 
-need() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
-need curl
-need gzip
-if ! command -v systemctl >/dev/null 2>&1; then
-  die "systemd is required (systemctl not found)"
+need() { command -v "$1" >/dev/null 2>&1; }
+need gzip || die "Missing required command: gzip"
+if ! need curl && ! need wget && ! need uclient-fetch; then
+  die "Missing downloader: install curl, or (OpenWrt) opkg update && opkg install ca-bundle"
 fi
 
 # ---- download binary ----------------------------------------------------
@@ -109,14 +138,35 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+fetch() {
+  url="$1"
+  out="$2"
+  if need curl; then
+    curl -fsSL --retry 3 --connect-timeout 15 -o "$out" "$url" && return 0
+  fi
+  if need wget; then
+    wget -q -O "$out" "$url" && return 0
+  fi
+  if need uclient-fetch; then
+    uclient-fetch -q -O "$out" "$url" && return 0
+  fi
+  return 1
+}
+
 log "downloading $URL"
-curl -fsSL --retry 3 --connect-timeout 15 -o "$TMP/node.gz" "$URL" \
-  || die "Download failed: $URL"
-gzip -dc "$TMP/node.gz" > "$TMP/xboard-node"
+fetch "$URL" "$TMP/node.gz" || die "Download failed: $URL
+On OpenWrt install ca-bundle first: opkg update && opkg install ca-bundle"
+gzip -dc "$TMP/node.gz" > "$TMP/xboard-node" || die "Failed to decompress $TMP/node.gz"
 chmod 755 "$TMP/xboard-node"
 
 # ---- install binary -----------------------------------------------------
-install -m 755 "$TMP/xboard-node" "$BIN"
+mkdir -p "$(dirname "$BIN")"
+if command -v install >/dev/null 2>&1; then
+  install -m 755 "$TMP/xboard-node" "$BIN"
+else
+  cp "$TMP/xboard-node" "$BIN"
+  chmod 755 "$BIN"
+fi
 log "installed $BIN"
 
 # ---- write config -------------------------------------------------------
@@ -157,9 +207,10 @@ umask 077
 chmod 600 "$CONFIG"
 log "wrote $CONFIG"
 
-# ---- systemd service ----------------------------------------------------
-mkdir -p /etc/systemd/system
-cat > "$SERVICE" <<'EOF'
+# ---- service ------------------------------------------------------------
+install_systemd() {
+  mkdir -p /etc/systemd/system
+  cat > "$UNIT" <<'EOF'
 [Unit]
 Description=KSXNode Node
 After=network-online.target
@@ -176,16 +227,78 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable xboard-node >/dev/null 2>&1 || true
-systemctl restart xboard-node
+  systemctl daemon-reload
+  systemctl enable xboard-node >/dev/null 2>&1 || true
+  systemctl restart xboard-node
+}
 
+install_procd() {
+  mkdir -p /etc/init.d /etc/rc.d
+  cat > "$INITD" <<'EOF'
+#!/bin/sh /etc/rc.common
+# Managed by the KSXNode installer.
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/local/bin/xboard-node -c /etc/xboard-node/config.yml
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param limits nofile="1048576 1048576"
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
+EOF
+  chmod 755 "$INITD"
+  "$INITD" enable >/dev/null 2>&1 || true
+  "$INITD" restart
+}
+
+case "$SERVICE_MODE" in
+  systemd) install_systemd ;;
+  procd) install_procd ;;
+  none)
+    warn "no init system selected; start manually: $BIN -c $CONFIG"
+    exit 0
+    ;;
+esac
+
+# ---- verify -------------------------------------------------------------
 sleep 2
-if systemctl is-active --quiet xboard-node; then
+RUNNING=0
+if [ "$SERVICE_MODE" = "systemd" ]; then
+  systemctl is-active --quiet xboard-node && RUNNING=1
+elif [ "$SERVICE_MODE" = "procd" ]; then
+  if command -v pidof >/dev/null 2>&1; then
+    pidof xboard-node >/dev/null 2>&1 && RUNNING=1
+  else
+    ps w 2>/dev/null | grep -q "[x]board-node -c" && RUNNING=1
+  fi
+else
+  ps 2>/dev/null | grep -q "[x]board-node -c" && RUNNING=1
+fi
+
+if [ "$RUNNING" -eq 1 ]; then
   log "KSXNode Node is running."
-  log "View logs: journalctl -u xboard-node -f"
+  if [ "$SERVICE_MODE" = "systemd" ]; then
+    log "View logs: journalctl -u xboard-node -f"
+  elif [ "$SERVICE_MODE" = "procd" ]; then
+    log "View logs: logread | grep xboard-node"
+  fi
 else
   warn "Service is not active. Recent logs:"
-  journalctl -u xboard-node -n 30 --no-pager || true
+  if [ "$SERVICE_MODE" = "systemd" ]; then
+    journalctl -u xboard-node -n 30 --no-pager || true
+  elif [ "$SERVICE_MODE" = "procd" ]; then
+    logread 2>/dev/null | grep xboard-node | tail -n 30 || true
+  fi
   exit 1
 fi
