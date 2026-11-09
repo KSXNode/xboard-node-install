@@ -30,6 +30,7 @@ KERNEL="singbox"
 DOMAIN=""
 VERSION="latest"
 SERVICE_MODE="auto"
+PORTS=""
 FORCE=0
 
 REPO="KSXNode/xboard-node-install"
@@ -56,7 +57,8 @@ Options:
   --kernel NAME         Kernel type (default: singbox)
   --domain DOMAIN       Certificate domain (default: panel hostname)
   --version TAG         Release tag (default: latest)
-  --service MODE        Init system: auto|systemd|procd|none (default: auto)
+  --service MODE        Init system: auto|systemd|procd|asuswrt|none (default: auto)
+  --ports RANGE         Asuswrt only: open this iptables port range, e.g. 7410:7413
   --force               Overwrite an existing config
   -h, --help            Show this help
 EOF
@@ -73,6 +75,7 @@ while [ $# -gt 0 ]; do
     --domain) DOMAIN="${2:-}"; shift 2 ;;
     --version) VERSION="${2:-}"; shift 2 ;;
     --service) SERVICE_MODE="${2:-}"; shift 2 ;;
+    --ports) PORTS="${2:-}"; shift 2 ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (use --help)" ;;
@@ -104,6 +107,8 @@ detect_service() {
     echo systemd
   elif [ -f /etc/rc.common ]; then
     echo procd
+  elif [ -d /jffs ] && [ -w /jffs ] && [ -d /data ]; then
+    echo asuswrt
   else
     echo none
   fi
@@ -113,8 +118,8 @@ if [ "$SERVICE_MODE" = "auto" ]; then
   SERVICE_MODE=$(detect_service)
 fi
 case "$SERVICE_MODE" in
-  systemd|procd|none) ;;
-  *) die "--service must be auto, systemd, procd or none" ;;
+  systemd|procd|asuswrt|none) ;;
+  *) die "--service must be auto, systemd, procd, asuswrt or none" ;;
 esac
 log "init system: $SERVICE_MODE"
 
@@ -135,9 +140,6 @@ else
   URL="https://github.com/$REPO/releases/download/$VERSION/xboard-node-$ARCH.gz"
 fi
 
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
 fetch() {
   url="$1"
   out="$2"
@@ -152,6 +154,193 @@ fetch() {
   fi
   return 1
 }
+
+# ---- Asuswrt / Broadcom routers (/jffs persistent, /tmp runtime) --------
+install_asuswrt() {
+  PERSIST=/jffs/xboard-node
+  RUN=/tmp/xboard-node
+  GZ="$PERSIST/xboard-node-$ARCH.gz"
+  CFG_P="$PERSIST/config.yml"
+  START="$PERSIST/start.sh"
+  HOOK=/data/startup.sh
+
+  mkdir -p "$PERSIST" "$RUN/data" /data || die "cannot create install directories"
+
+  # persistent compressed binary
+  if [ ! -s "$GZ" ] || [ "$FORCE" -eq 1 ]; then
+    log "downloading $URL"
+    TMPGZ="$GZ.tmp.$$"
+    fetch "$URL" "$TMPGZ" || { rm -f "$TMPGZ"; die "Download failed: $URL"; }
+    mv -f "$TMPGZ" "$GZ" || die "cannot write $GZ"
+    log "installed $GZ"
+  else
+    log "existing archive kept: $GZ (use --force to replace)"
+  fi
+
+  # persistent config
+  if [ -f "$CFG_P" ] && [ "$FORCE" -eq 0 ]; then
+    BAK="$CFG_P.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$CFG_P" "$BAK" 2>/dev/null || true
+    warn "existing config backed up to $BAK"
+  fi
+  umask 077
+  {
+    echo "panel:"
+    echo "  url: \"$PANEL\""
+    if [ "$MODE" = "machine" ]; then
+      echo
+      echo "machine:"
+      echo "  machine_id: $MACHINE_ID"
+      echo "  token: \"$TOKEN\""
+    else
+      echo "  token: \"$TOKEN\""
+      echo "  node_id: $NODE_ID"
+    fi
+    echo
+    echo "kernel:"
+    echo "  type: \"$KERNEL\""
+    echo "  config_dir: \"$RUN/data\""
+    echo "  log_level: \"warn\""
+    echo
+    echo "cert:"
+    echo "  cert_mode: \"self\""
+    echo "  domain: \"$DOMAIN\""
+    echo
+    echo "log:"
+    echo "  level: \"info\""
+    echo "  output: \"stdout\""
+  } > "$CFG_P"
+  chmod 600 "$CFG_P"
+  log "wrote $CFG_P"
+
+  # persistent start script
+  cat > "$START" <<'STARTEOF'
+#!/bin/sh
+# KSXNode xboard-node bootstrap for ASUS / Broadcom routers (Asuswrt).
+# Persistent files live in /jffs; the binary is decompressed to /tmp on boot.
+set -u
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+PERSIST=/jffs/xboard-node
+GZ="$PERSIST/xboard-node.gz"
+CFG_P="$PERSIST/config.yml"
+RUN=/tmp/xboard-node
+BIN="$RUN/xboard-node"
+CFG="$RUN/config.yml"
+PID="$RUN/xboard-node.pid"
+LOG="$RUN/xboard-node.log"
+LOCK="$RUN/.start.lock"
+PORT_RANGE=""
+
+mkdir -p "$RUN" "$RUN/data" "$PERSIST"
+
+# open the configured node ports (idempotent, additive)
+for proto in tcp udp; do
+    [ -n "$PORT_RANGE" ] || break
+    iptables -C INPUT -p "$proto" --dport "$PORT_RANGE" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p "$proto" --dport "$PORT_RANGE" -j ACCEPT 2>/dev/null
+done
+
+# single instance
+if ! mkdir "$LOCK" 2>/dev/null; then
+    OLD=$(cat "$LOCK/pid" 2>/dev/null || true)
+    if [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null; then
+        echo "[xboard] another start is running"
+        exit 0
+    fi
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || exit 0
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+
+if ps | grep -q "[/]tmp/xboard-node/xboard-node"; then
+    echo "[xboard] already running"
+    exit 0
+fi
+
+if [ ! -x "$BIN" ]; then
+    [ -s "$GZ" ] || { echo "[xboard] missing $GZ"; exit 1; }
+    TMPBIN="$BIN.tmp.$$"
+    gunzip -c "$GZ" > "$TMPBIN" || { rm -f "$TMPBIN"; exit 1; }
+    chmod 755 "$TMPBIN" && mv -f "$TMPBIN" "$BIN" || { rm -f "$TMPBIN"; exit 1; }
+fi
+
+[ -s "$CFG_P" ] || { echo "[xboard] missing $CFG_P"; exit 1; }
+cp -f "$CFG_P" "$CFG"
+
+if [ -f "$LOG" ] && [ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt 524288 ]; then
+    mv -f "$LOG" "$LOG.1" 2>/dev/null || true
+fi
+
+nohup "$BIN" -c "$CFG" >>"$LOG" 2>&1 &
+echo $! > "$PID"
+sleep 6
+
+if kill -0 "$(cat "$PID")" 2>/dev/null; then
+    echo "[xboard] started (pid $(cat "$PID"))"
+else
+    echo "[xboard] failed to start"
+    tail -n 20 "$LOG" 2>/dev/null
+    exit 1
+fi
+STARTEOF
+
+  sed -i "s#xboard-node.gz#xboard-node-$ARCH.gz#" "$START"
+  if [ -n "$PORTS" ]; then
+    sed -i "s#^PORT_RANGE=\"\"#PORT_RANGE=\"$PORTS\"#" "$START"
+  fi
+  chmod 755 "$START"
+  log "wrote $START"
+
+  # boot hook in /data
+  if [ ! -f "$HOOK" ] || ! grep -q "KSXNode_ASUSWRT_BOOT" "$HOOK" 2>/dev/null; then
+    if [ -s "$HOOK" ]; then
+      BAK="$HOOK.bak.$(date +%Y%m%d%H%M%S)"
+      cp -p "$HOOK" "$BAK" 2>/dev/null || true
+      warn "existing $HOOK backed up to $BAK"
+    fi
+    cat > "$HOOK" <<'HOOKEOF'
+#!/bin/sh
+# KSXNode_ASUSWRT_BOOT
+i=0
+while [ ! -f /jffs/xboard-node/start.sh ] && [ "$i" -lt 30 ]; do
+    i=$((i + 1))
+    sleep 1
+done
+if [ -x /jffs/xboard-node/start.sh ]; then
+    /jffs/xboard-node/start.sh >> /tmp/xboard-node-boot.log 2>&1
+fi
+HOOKEOF
+    chmod 755 "$HOOK"
+    log "wrote boot hook $HOOK"
+  else
+    log "boot hook already present: $HOOK"
+  fi
+
+  # start now
+  /bin/sh "$START" || true
+
+  sleep 2
+  if ps | grep -q "[/]tmp/xboard-node/xboard-node"; then
+    log "KSXNode Node is running (Asuswrt /jffs mode)."
+    log "Persistent: $PERSIST"
+    log "Runtime:    $RUN"
+    return 0
+  fi
+  warn "Service is not active. Recent logs:"
+  tail -n 30 "$RUN/xboard-node.log" 2>/dev/null || true
+  return 1
+}
+
+if [ "$SERVICE_MODE" = "asuswrt" ]; then
+  install_asuswrt || exit 1
+  exit 0
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 
 log "downloading $URL"
 fetch "$URL" "$TMP/node.gz" || die "Download failed: $URL
